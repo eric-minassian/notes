@@ -3,7 +3,10 @@ title: "GovCloud-Compatible React SPA on ECS Fargate"
 description: "Serve a Vite SPA from nginx on Fargate behind an internal ALB, with no CloudFront, no NAT, no public endpoints. GovCloud-ready."
 date: 2026-04-18
 tags: ["aws", "govcloud", "cdk", "ecs-fargate", "alb", "spa"]
+repo: "https://github.com/eric-minassian/govcloud-frontend"
 ---
+
+**Source:** [eric-minassian/govcloud-frontend](https://github.com/eric-minassian/govcloud-frontend)
 
 ## Context
 
