@@ -1,5 +1,9 @@
 # Research Notes
 
+There is no need for you to read the other markdown docs since they are all unrelated to your current task.
+
+The result of all tasks should be a markdown file(s).
+
 One folder per topic, kebab-case named (e.g., `cap-theorem`). Entry point is always `index.md`. Only modify files within your topic folder.
 
 ## Frontmatter (required)
