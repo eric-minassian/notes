@@ -238,3 +238,229 @@ flowchart TD
 - **Avoid F (Amplify+AppSync) if** you'll need to escape the managed box later, or if the team doesn't want GraphQL.
 - **CloudFront OAC + Lambda Function URL with `AWS_IAM`** is an underused combo — locks the BFF to CloudFront-only access without needing APIGW or a custom authorizer.
 - **Observability**: all options emit to CloudWatch natively; X-Ray works across APIGW/Lambda/ALB/Fargate. AppSync has its own logging mode that's CloudWatch-based but schema-aware.
+
+## Partition & Compliance Considerations
+
+Service availability and accreditation shift the architecture calculus significantly. Verify against the current [AWS Services in Scope](https://aws.amazon.com/compliance/services-in-scope/) page before committing.
+
+### FedRAMP High (Commercial Partition)
+
+Most services used in A–F are FedRAMP High accredited. The exceptions matter:
+
+| Service | FedRAMP High | Impact |
+|---|---|---|
+| CloudFront | ✅ | — |
+| Lambda, Lambda@Edge | ✅ | — |
+| CloudFront Functions | ✅ (under CloudFront) | — |
+| S3, API Gateway, ALB, ECS, Fargate | ✅ | — |
+| Cognito User Pools | ✅ | — |
+| AppSync | ✅ | — |
+| WAF, KMS, ACM | ✅ | — |
+| **App Runner** | ❌ Moderate only | **Rules out D** |
+| **Amplify Hosting** | ❌ Moderate only | **Rules out F** (AppSync itself is High — use raw APIGW/CloudFront hosting) |
+
+Additional constraints:
+
+- Use FIPS 140-3 endpoints for AWS API calls (`*.api.aws` FIPS endpoints or service-specific FIPS endpoints)
+- Enable FIPS on ALB / CloudFront (TLS 1.2+ with FIPS ciphers)
+- Customer-managed KMS keys for S3, Secrets Manager, logs
+- VPC Flow Logs, CloudTrail org-trail, Config, GuardDuty, Security Hub all expected for the ATO package
+- **Lambda@Edge in a FedRAMP boundary**: edge execution crosses many regions and complicates boundary diagrams. Several programs choose to keep edge compute out of the authorization boundary and put all business logic in a regional BFF. Keep L@E thin (auth/routing) or avoid entirely.
+
+**Recommended for FedRAMP High**: A (APIGW + Lambda) or C (ALB + Fargate). Use E sparingly.
+
+### GovCloud (us-gov-west-1 / us-gov-east-1)
+
+The killer constraint: **CloudFront is not native to the GovCloud partition**, and neither are Lambda@Edge or CloudFront Functions. This eliminates every architecture that centers on CloudFront for same-origin routing.
+
+Service availability snapshot:
+
+| Service | GovCloud | Notes |
+|---|---|---|
+| S3, Lambda, API Gateway (REST + HTTP), ALB, ECS, Fargate | ✅ | Core building blocks present |
+| Cognito (User + Identity Pools) | ✅ | Both regions |
+| WAF (Regional) | ✅ | No CloudFront WAF since no CloudFront |
+| AppSync | ⚠️ | us-gov-west-1 yes; verify us-gov-east-1 |
+| KMS, ACM, Secrets Manager | ✅ | — |
+| **CloudFront** | ❌ | Not in partition |
+| **Lambda@Edge / CloudFront Functions** | ❌ | Tied to CloudFront |
+| **App Runner** | ❌ | — |
+| **Amplify Hosting** | ❌ | — |
+
+GovCloud regions are FedRAMP High by baseline (and support DoD IL4/IL5) — compliance alignment comes with the partition rather than per-service gymnastics.
+
+#### GovCloud SPA + BFF pattern
+
+The pragmatic shape: **ALB + Fargate serving both the SPA bundle and the BFF routes**, behind Regional WAF.
+
+```mermaid
+graph TB
+    U[Browser] --> R53[Route 53]
+    R53 --> WAF[AWS WAF Regional]
+    WAF --> ALB[ALB<br/>ACM cert, FIPS]
+    ALB -->|/*| FG[ECS Fargate Task<br/>Fastify/Nginx<br/>serves static + /api/*]
+    FG --> DS[Downstream services]
+    FG -.-> COG[Cognito<br/>GovCloud User Pool]
+```
+
+Why this shape:
+
+- **Same-origin by construction** — SPA assets and API share host/port/scheme. No CORS, cookies can be `SameSite=Strict`.
+- **One TLS termination** on the ALB with ACM-issued cert; FIPS policy enabled.
+- **Regional WAF** attaches to ALB (CloudFront WAF isn't available).
+- **Fargate serves `/*` from a static dir** (nginx sidecar or the Node process) and `/api/*` from the BFF handler. Single image, single deploy.
+- **No global CDN**. Users see region-RTT for assets. If low-latency-global matters and clearance rules allow, put a commercial CDN in front of a GovCloud-hosted backend (rare; usually blocked by boundary rules).
+
+#### Alternative: S3 + API Gateway (no Fargate)
+
+```mermaid
+graph TB
+    U[Browser] --> R53[Route 53]
+    R53 --> APIGW[API Gateway<br/>REST API, Regional<br/>custom domain + ACM]
+    APIGW -->|/*| S3[S3 bucket<br/>SPA bundle via AWS integration]
+    APIGW -->|/api/*| LAM[Lambda BFF]
+    LAM --> DS[Downstream]
+    LAM -.-> COG[Cognito GovCloud]
+```
+
+- APIGW proxies SPA fetches to S3 via an AWS service integration. Adds per-asset APIGW cost; no CDN caching.
+- Payload limits (10MB response) bite on large bundles — code-split aggressively.
+- Works without running always-on Fargate; scale-to-zero friendly.
+
+#### What changes vs commercial
+
+- **Drop architectures B, D, and Amplify-flavored F** (no L@E, no CloudFront, no App Runner, no Amplify).
+- **Architecture C becomes the default**, not a fallback.
+- **Architecture A** still works but requires the S3+APIGW pattern above (no CloudFront fronting S3).
+- **Route 53** in GovCloud is its own hosted zone; commercial and GovCloud DNS are separate.
+- **ACM certs** must be issued in the same GovCloud region as the ALB/APIGW.
+- **ECR** images live in GovCloud ECR; no cross-partition image pulls.
+
+### Quick Cross-Partition Matrix
+
+| Architecture | Commercial | Commercial + FedRAMP High | GovCloud |
+|---|---|---|---|
+| A: CF + APIGW + Lambda | ✅ | ✅ | ⚠️ No CF → S3+APIGW variant only |
+| B: CF + Lambda Function URL | ✅ | ✅ | ❌ No CloudFront |
+| C: CF + ALB + Fargate | ✅ | ✅ | ✅ Drop CF, use ALB + Fargate direct (the default GovCloud pattern) |
+| D: CF + App Runner | ✅ | ❌ App Runner not High | ❌ No App Runner |
+| E: Lambda@Edge layer | ✅ | ⚠️ Boundary complexity | ❌ No L@E |
+| F: Amplify + AppSync | ✅ | ⚠️ Amplify Hosting Moderate only | ❌ No Amplify Hosting |
+
+## Authentication & Authorization
+
+Auth splits into three concerns: **who the user is** (authN), **what they can do** (authZ), and **how the session is carried** to the BFF (transport — covered in Cross-Cutting Decisions).
+
+### Decision axes
+
+- **Workforce vs customer**: employees/contractors (workforce) often need SSO into an existing IdP; customers/citizens get their own user directory or federated consumer IdPs.
+- **PIV / CAC required?** Federal civilian agencies require PIV; DoD requires CAC. Forces mTLS or a federation broker that validates smart cards.
+- **Internal-only vs public**: internal apps can use IAM Identity Center; public apps need a user-facing OIDC/OAuth provider.
+- **Session duration & revocation**: short-lived JWTs are simple but harder to revoke; server-side sessions (BFF-managed cookie → Redis/DynamoDB) revoke instantly.
+
+### AuthN options across partitions
+
+| Option | Commercial | FedRAMP High (Commercial) | GovCloud |
+|---|---|---|---|
+| **Cognito User Pools** (native directory) | ✅ | ✅ | ✅ both regions |
+| **Cognito federated** to SAML/OIDC IdP | ✅ | ✅ | ✅ |
+| **IAM Identity Center** (workforce SSO) | ✅ | ✅ | ✅ |
+| **Login.gov** (citizen-facing federal) | N/A | ✅ (FedRAMP High) | N/A (consumed from commercial) |
+| **ICAM / agency IdP** (PIV/CAC via SAML) | ⚠️ rare | ⚠️ agency-dependent | ✅ standard |
+| **Okta / Entra ID / Ping / Auth0** | ✅ | ⚠️ pick FedRAMP-High SKU (Okta Gov, Entra Gov) | ⚠️ commercial-hosted only — boundary concern |
+| **Keycloak self-hosted on ECS** | ✅ | ✅ (you own the ATO) | ✅ |
+| **ALB mTLS** (PIV/CAC client cert) | ✅ | ✅ | ✅ |
+| **APIGW mTLS** (custom domain) | ✅ | ✅ | ✅ |
+| **Lambda@Edge Cognito pattern** (edge auth) | ✅ | ⚠️ boundary complexity | ❌ no L@E |
+
+### AuthZ options
+
+| Option | Notes | Partition coverage |
+|---|---|---|
+| **Cognito groups + ID token claims** | Coarse-grained; easy; stale until token refresh | Everywhere Cognito runs |
+| **OAuth scopes / custom JWT claims** | Standard; BFF enforces; claim drift risk | All |
+| **Amazon Verified Permissions** (Cedar) | Managed policy engine, fine-grained, audit trail | Commercial ✅ (check FedRAMP status); **not in GovCloud** |
+| **OPA / Cedar self-hosted** | Portable, partition-agnostic; you run it | All |
+| **Custom in BFF** | Most flexible; hardest to audit | All |
+| **IAM policies** (for IAM-authed calls: AppSync IAM, S3 pre-signed, SigV4) | Tight integration with AWS services | All |
+
+### Session transport to the BFF
+
+Reiterating the earlier section in auth terms:
+
+- **BFF-managed session cookie** (HttpOnly, Secure, SameSite=Strict): SPA never holds tokens. BFF does the OIDC code exchange, stores refresh token server-side (encrypted, DynamoDB/ElastiCache), returns an opaque session ID. **Strongly preferred for FedRAMP / GovCloud** — minimizes token exposure, supports instant revocation.
+- **Bearer token in JS memory**: SPA holds access token, attaches `Authorization` header. Simpler BFF but bigger XSS blast radius and no server-side revocation.
+- **Never** store tokens in `localStorage` or non-HttpOnly cookies.
+
+### Recommended shapes
+
+#### Commercial (customer-facing)
+
+```mermaid
+sequenceDiagram
+    participant U as Browser SPA
+    participant CF as CloudFront
+    participant BFF as BFF (Lambda/Fargate)
+    participant COG as Cognito (Hosted UI)
+    U->>CF: GET /app
+    CF->>U: SPA bundle
+    U->>BFF: GET /api/me (no session)
+    BFF->>U: 401 + redirect URL
+    U->>COG: OIDC authorize
+    COG->>U: redirect + code
+    U->>BFF: GET /auth/callback?code
+    BFF->>COG: exchange code (client secret)
+    COG->>BFF: tokens
+    BFF->>U: Set-Cookie: session=... (HttpOnly)
+    U->>BFF: GET /api/me (cookie)
+    BFF->>U: 200
+```
+
+- Cognito User Pool as directory, Hosted UI for login.
+- Federate to social IdPs (Google/Apple) or enterprise (SAML) as needed.
+- Verified Permissions for fine-grained authZ if the policy graph grows.
+
+#### FedRAMP High (workforce)
+
+- **IAM Identity Center** fronting the app (OIDC app assignment) → Cognito federated identity, OR direct OIDC to ALB/APIGW.
+- Enforce hardware MFA (FIDO2) via the upstream IdP.
+- Use **ALB `authenticate-oidc`** action if BFF runs on Fargate — ALB handles the OIDC dance, forwards identity headers (`x-amzn-oidc-identity`, `x-amzn-oidc-data` JWT) to the task.
+- Keep Lambda@Edge out of the authorization boundary; do auth at the regional BFF.
+- Verified Permissions currently FedRAMP Moderate — verify High status before relying on it; otherwise Cedar self-hosted or OPA.
+
+#### GovCloud (PIV/CAC or agency IdP)
+
+```mermaid
+sequenceDiagram
+    participant U as Browser (PIV/CAC)
+    participant ALB as ALB (Regional WAF, FIPS)
+    participant FG as Fargate (SPA + BFF)
+    participant IDP as Agency IdP / ICAM (SAML/OIDC)
+    U->>ALB: GET /app (mTLS client cert)
+    ALB->>ALB: verify client cert chain
+    ALB->>FG: forward + x-amzn-mtls-clientcert
+    FG->>U: 302 to IdP (if no session)
+    U->>IDP: SAML / OIDC auth (PIV-backed)
+    IDP->>FG: SAML response / OIDC code
+    FG->>U: Set-Cookie: session=... (HttpOnly, Strict)
+    U->>FG: subsequent requests (cookie + cert)
+```
+
+Key points:
+
+- **ALB mTLS** terminates the client cert (PIV/CAC). Two modes: *passthrough* (forward cert to BFF for validation) or *verify* (ALB checks against trust store — uploaded CA bundle in S3). Prefer *verify* + forward for defense in depth.
+- **Cognito in GovCloud** works as an identity broker — federate to agency IdP via SAML, map PIV identifiers (EDIPI for DoD, UUID for civilian) to Cognito user attributes.
+- **No Lambda@Edge / no CloudFront Functions** — all auth logic lives on ALB or in the Fargate BFF.
+- **Login.gov** is not usable from GovCloud-hosted apps directly (Login.gov is a commercial-partition service consuming commercial CloudFront). For citizen-facing GovCloud apps, federation happens through approved FICAM TFS providers or agency IdP.
+- **Session store** (refresh tokens, server sessions): DynamoDB or ElastiCache in GovCloud; encrypt with customer-managed KMS keys.
+
+### Partition cheat sheet
+
+| Need | Commercial | FedRAMP High | GovCloud |
+|---|---|---|---|
+| Citizen/consumer login | Cognito + social / Login.gov | Cognito + Login.gov | Cognito + FICAM broker |
+| Workforce SSO | IAM Identity Center | IAM Identity Center + FIDO2 | IAM Identity Center or agency IdP |
+| PIV / CAC | Rare | ALB mTLS + SAML broker | ALB mTLS + ICAM / agency IdP |
+| Fine-grained authZ | Verified Permissions | Cedar self-hosted (until VP reaches High) | Cedar / OPA self-hosted |
+| Edge auth | Lambda@Edge OK | Avoid in boundary | Not available |
+| Session transport | BFF cookie preferred | BFF cookie required | BFF cookie required |
