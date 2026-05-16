@@ -131,49 +131,58 @@ Best balance of ownership, extensibility, and security.
 
 ## Option 3 — Token-mediating backend pattern
 
-In this model, frontend BFF does more than proxy. It actively mediates tokens: it receives ALB/OIDC session context, exchanges or mints a downstream token, then calls the router.
+In this model, the frontend backend handles OAuth responsibilities as a confidential client. It obtains, stores, and refreshes tokens server-side, then gives the browser a short-lived access token when needed. The browser uses that access token to call the router API directly.
+
+This is lighter than a full BFF because the backend does **not** proxy every API request and response. It is also less secure than a full BFF because access tokens are exposed to browser JavaScript, but it still improves on a pure browser OAuth client because refresh tokens and client credentials remain server-side.
 
 ```mermaid
 sequenceDiagram
     participant Browser
-    participant ALB as Frontend ALB
-    participant BFF as Token-Mediating BFF
+    participant ALB as Frontend ALB domain.com
+    participant TokenBackend as Token-Mediating Backend
     participant IdP as Cognito/Okta/Auth Service
-    participant APIGW as Router API Gateway
+    participant APIGW as Router API Gateway api.domain.com
     participant Router
     participant Service
 
-    Browser->>ALB: GET /api/orders
-    ALB->>BFF: Request with authenticated OIDC headers
-    BFF->>IdP: Exchange/introspect/refresh token
-    IdP-->>BFF: Router-facing token or claims
-    BFF->>APIGW: Request with normalized token
+    Browser->>ALB: GET /app
+    ALB->>ALB: Redirect to IdP if unauthenticated
+    ALB-->>Browser: React SPA assets + HttpOnly session cookie
+
+    Browser->>TokenBackend: Request access token using session cookie
+    TokenBackend->>IdP: Obtain/refresh token as confidential client
+    IdP-->>TokenBackend: Access token + refresh token
+    TokenBackend-->>Browser: Short-lived access token only
+
+    Browser->>APIGW: GET /orders Authorization: Bearer access_token
     APIGW->>Router: Invoke router
     Router->>Service: Route request
     Service-->>Router: Response
-    Router-->>BFF: Response
-    BFF-->>Browser: Response
+    Router-->>APIGW: Response
+    APIGW-->>Browser: Response
 ```
 
 ### Good
 
-- Strongest abstraction between browser auth and backend auth.
-- Router sees a clean, stable token/claims model.
-- Easier to swap Cognito for Okta later if BFF owns token mediation.
-- Can support fine-grained frontend session rules, token refresh, and claims normalization.
-- Browser does not need direct access to backend-oriented credentials.
+- Lighter than a full BFF because normal API traffic goes directly from browser to router.
+- Avoids proxying all requests and responses through frontend infrastructure.
+- Refresh tokens and confidential-client credentials stay server-side.
+- Prevents browser-side malicious code from directly stealing refresh tokens.
+- Preserves the router API as the single front door for both frontend and partner traffic.
+- Easier to swap Cognito for Okta later if token handling is centralized in the token-mediating backend.
 
 ### Bad
 
-- More complex than a simple proxy BFF.
-- Can add significant latency if token exchange/introspection happens per request.
-- Requires careful caching and token lifecycle management.
-- BFF becomes security-critical.
-- More implementation burden and more audit surface.
+- Less secure than a full BFF because access tokens are still exposed to browser JavaScript.
+- XSS can steal the current access token or ask the token-mediating backend for a fresh access token while the user session is valid.
+- Requires CORS because the browser calls `api.domain.com` directly.
+- Frontend must handle access-token lifetime, retry, and refresh coordination.
+- Frontend-only endpoints still need a separate home and should not accidentally enter the partner SDK contract.
+- API auth and frontend asset auth remain separate enforcement points.
 
 ### Fit
 
-Good if the organization needs strong IdP abstraction or does not want browser-held access tokens to be passed to the router. Potentially overkill for the first iteration.
+Good when avoiding a BFF proxy hop is important, while still keeping refresh tokens and OAuth confidential-client responsibilities out of the browser. It is a middle ground: more secure than a pure SPA OAuth client, but less secure and less centrally controlled than a full BFF.
 
 ---
 
@@ -224,7 +233,7 @@ Reasonable for a pure SPA model, but less attractive when frontend already needs
 
 ## Recommendation
 
-Recommend **Option 2: Frontend BFF forwards to router-owned API Gateway**, with a path to Option 3 if stronger token mediation becomes necessary.
+Recommend **Option 2: Frontend BFF forwards to router-owned API Gateway**. Consider Option 3 only if the extra BFF proxy hop becomes unacceptable and the team is comfortable exposing short-lived access tokens to browser JavaScript.
 
 ```mermaid
 flowchart LR
