@@ -1,453 +1,513 @@
 ---
-title: "AWS GovCloud Authenticated SPA and API Router"
-description: "Reference architecture for a FedRAMP High GovCloud React SPA, authenticated asset delivery, API router, partner SDKs, and machine-to-machine access."
+title: "AWS GovCloud Authenticated SPA and API Router Architecture"
+description: "A FedRAMP High-oriented AWS-native architecture for protected React assets, generic OIDC login, partner SDK APIs, machine-to-machine auth, and an extensible API router."
 date: 2026-05-15
-tags: ["aws", "govcloud", "fedramp", "architecture", "authentication", "spa", "api"]
+tags: ["aws", "govcloud", "fedramp", "architecture", "oidc", "spa", "api"]
 ---
 
-# AWS GovCloud Authenticated SPA and API Router
+# AWS GovCloud Authenticated SPA and API Router Architecture
 
-## Recommendation
+## Executive recommendation
 
-Use a **regional AWS GovCloud architecture** with:
+Use an **AWS GovCloud (US) regional, ALB-fronted container architecture**:
 
-- **Application Load Balancer (ALB) OIDC authentication** in front of the React SPA so unauthenticated users cannot fetch `index.html`, JavaScript bundles, CSS, images, or other frontend assets.
-- A **private frontend asset service** on ECS/Fargate or EC2 that serves the built React artifacts only after the ALB authenticates the browser session.
-- A shared **router service** as the front door to backend domains such as Commercial, User Management, and future services.
-- A separate partner/API domain on **Amazon API Gateway** that forwards to the same router and supports machine-to-machine OAuth, partner SDK distribution, throttling, usage controls, and a later move to mTLS.
-- **OIDC/OAuth as the identity abstraction**, so Cognito can be the first IdP while Okta or another OIDC provider can replace it without changing the router or frontend contract.
+- **Public HTTPS Application Load Balancer (ALB)** as the single browser entry point for `app.example.gov`.
+- **ALB `authenticate-oidc`** for all SPA asset routes, backed by a generic OIDC provider. Cognito can be the first IdP, but Okta, Entra ID, or another OIDC IdP can replace it without changing the app or router contract.
+- **React SPA served from an ECS Fargate frontend/static-assets service**, not directly from public S3. This keeps frontend assets unreachable unless the ALB authentication session exists.
+- **API router service on ECS Fargate** behind the same ALB for same-origin browser calls and partner API calls.
+- **Router-owned authn/authz policy** for APIs: browser identities come from signed ALB OIDC headers; partner and machine clients use OAuth2 client-credentials JWTs now, with a path to ALB/API Gateway mTLS later.
+- **Backend services remain private** behind internal ALBs, Cloud Map, or service-to-service discovery. The router is the only public API ingress.
+- **OpenAPI generated from the router’s external API contract**, then SDKs are generated only from the public/partner operations. Frontend-only integration, AppConfig, and telemetry endpoints are excluded from the partner spec.
 
-This avoids public S3 website hosting and avoids requiring the SPA itself to hold privileged credentials just to fetch its own static assets.
+This path favors **hard asset protection and IdP portability** over CDN convenience. CloudFront is not the primary recommendation because AWS notes that CloudFront is not available from GovCloud Regions in a GovCloud web-app reference, and CloudFront is listed for FedRAMP Moderate but not FedRAMP High/GovCloud in the AWS services-in-scope table. If a program authorizing official approves a commercial-region CloudFront component, it can be added later as an optimization, but it complicates the “GovCloud deployment” and protected-assets requirements.
+
+## Research findings that shape the design
+
+| Finding | Architectural impact |
+|---|---|
+| AWS GovCloud is a FedRAMP High-oriented partition; the FedRAMP Marketplace lists AWS GovCloud as certified with a High class, and AWS lists API Gateway, Cognito, ECS, ECR, ALB-adjacent EC2/VPC, S3, CloudWatch, X-Ray, WAF, ACM, Private CA, Secrets Manager, KMS, AppConfig-adjacent Systems Manager services, and Verified Permissions as in-scope for FedRAMP High/GovCloud. | Use GovCloud-native regional services as the baseline. Validate final service list against the current AWS Artifact package for the customer boundary. |
+| Amazon Cognito is available in AWS GovCloud, uses FIPS endpoints, has GovCloud hosted UI URL formats, and does **not** support Cognito custom domains in GovCloud. | Treat Cognito as an OIDC IdP, not as a domain-branding dependency. Expect a Cognito `auth-fips` hosted UI domain unless an external IdP owns the branded login domain. |
+| ALB user authentication supports generic OIDC IdPs and redirects unauthenticated users to the IdP. ALB direct `authenticate-cognito` region list does not include GovCloud, but generic `authenticate-oidc` is the portable mechanism. ALB OIDC requires publicly resolvable IdP endpoints and HTTPS listeners. | Configure ALB with `authenticate-oidc` rather than `authenticate-cognito`. This keeps Okta/Cognito/other IdP swap simple. |
+| ALB auth sends a secure session cookie, redirects unauthenticated app users, and forwards identity to targets in `x-amzn-oidc-*` headers. AWS says targets must verify signed `x-amzn-oidc-data` and validate the expected ALB ARN signer; GovCloud public-key endpoints are S3 URLs. | The router/frontend must verify ALB identity headers before making authorization decisions. Targets should only accept traffic from the ALB security group. |
+| ALB mTLS supports verify and passthrough modes, trust stores, revocation lists, and forwards client certificate data in `X-Amzn-Mtls-*` headers. | ALB is a good long-term front door if partner mTLS becomes mandatory. Add a dedicated partner listener/domain when mTLS is introduced. |
+| API Gateway in GovCloud is FIPS-compliant by default, supports regional APIs and mTLS custom domains, but has GovCloud differences: no edge-optimized APIs; HTTP API private integrations are not supported in GovCloud East; mTLS endpoints do not support ECDSA server certificates; mTLS is not supported for private APIs. | API Gateway is viable for a later dedicated partner edge, especially for JWT authorizers and mTLS, but do not depend on HTTP API private integrations in all GovCloud Regions. If used, integrate to the router with Lambda, public/internal ALB patterns validated per Region, or VPC Link capabilities available in the target Region. |
+| API Gateway JWT authorizers validate OIDC/OAuth2 JWTs using issuer JWKS, audience/client_id, expiry, nbf/iat, and route scopes. AWS recommends requiring authorization scopes to avoid accepting unintended ID tokens. | For partner SDK and machine-to-machine access, use scoped OAuth2 access tokens and route-level scopes. This can be enforced at API Gateway later or directly in the router now. |
+| AWS AppConfig Agent can run as an ECS/EKS sidecar, uses the task role to call AppConfig, caches config locally, and serves config to the app on localhost port 2772. | Keep AppConfig access server-side in the frontend-support service or router, not in the browser SDK. |
+| AWS GovCloud reference architectures commonly host SPAs in S3 and use API Gateway/Lambda, but their example makes S3 website content accessible through CloudFront patterns and does not guarantee “no frontend assets unless authenticated.” | For this requirement, serve static assets from a private ECS/Nginx service behind ALB auth, or use a purpose-built authenticated asset service. |
+
+## Target architecture
 
 ```mermaid
 flowchart LR
-    U[Browser user] -->|GET app.example.gov| ALB[Public ALB in AWS GovCloud]
-    ALB -->|No auth cookie| IDP["OIDC IdP: Cognito, Okta, or other"]
-    IDP -->|Authorization code redirect| ALB
-    ALB -->|Authenticated request| FE["Private frontend asset service: ECS/Fargate or EC2"]
-    FE -->|Serves React assets| U
+  U[Authenticated browser user] -->|HTTPS app.example.gov| WAF[AWS WAF]
+  WAF --> ALB[Public ALB in GovCloud]
 
-    U -->|Same-origin /api requests with ALB session cookie| ALB
-    ALB -->|x-amzn-oidc-* claims headers| ROUTER[Router service]
+  ALB -->|OIDC redirect if no session| IDP[OIDC IdP<br/>Cognito auth-fips, Okta, etc.]
+  IDP -->|auth code callback<br/>/oauth2/idpresponse| ALB
 
-    PARTNER[Partner SDK / workload] -->|OAuth client credentials, future mTLS| APIGW["API Gateway custom domain: api.example.gov"]
-    APIGW -->|VPC Link / private integration| ROUTER
+  ALB -->|/ static assets<br/>authenticate-oidc required| FE[ECS Fargate frontend asset service<br/>Nginx or Node static server]
+  ALB -->|/api/* same-origin<br/>ALB OIDC headers or bearer token| R[API Router ECS Fargate]
+  ALB -->|/internal/frontend/*<br/>not in partner SDK| FS[Frontend-support service<br/>integration + config + telemetry helpers]
 
-    ROUTER --> COMM[Commercial service]
-    ROUTER --> USER[User Management service]
-    ROUTER --> OTHER[Other domain services]
-    ROUTER --> AUX["Frontend support service: integration, AppConfig, OTEL"]
+  R -->|private HTTP/gRPC| C[Commercial service]
+  R -->|private HTTP/gRPC| UM[User Management service]
+  R -->|private HTTP/gRPC| SVC[Other domain services]
+
+  FS --> AC[AWS AppConfig Agent sidecar<br/>localhost:2772]
+  R --> VP[Optional Amazon Verified Permissions<br/>or policy engine]
+  R --> OBS[ADOT/Otel Collector sidecar<br/>CloudWatch/X-Ray/partner sink]
+
+  P[Partner or machine client SDK] -->|HTTPS api.example.gov<br/>Bearer JWT now; mTLS later| WAF
 ```
 
-## Why This Shape Fits
+### Logical domains
 
-AWS GovCloud is intended for workloads that need FedRAMP High-aligned architectures, and AWS publishes which services are in scope for FedRAMP High in GovCloud. Amazon Cognito is available in GovCloud with FIPS endpoints, and ALB supports OIDC authentication and redirects unauthenticated users to an IdP before forwarding traffic to targets. API Gateway supports custom domains, private integrations through VPC links, generated SDKs for REST APIs, and mTLS on custom domains.
+| Domain | Audience | Front door behavior | Target |
+|---|---|---|---|
+| `app.example.gov` | Human browser users | ALB OIDC login required for `/`, `/assets/*`, SPA fallback routes. | Frontend asset service. |
+| `app.example.gov/api/*` | SPA runtime | Same-origin calls. Router accepts signed ALB user headers for browser identity. | API router. |
+| `api.example.gov` or `app.example.gov/partner-api/*` | Partners, SDK users, service accounts | No interactive redirects. Require OAuth2 access token; add mTLS on dedicated listener/domain when ready. | Same API router, partner route group. |
+| `app.example.gov/internal/frontend/*` | SPA support only | ALB authenticated, but excluded from partner OpenAPI. | Frontend-support service or router private route group. |
 
-CloudFront can restrict content with signed URLs and signed cookies, but AWS currently describes CloudFront compliance as FedRAMP Moderate in its CloudFront overview. For a strict GovCloud/FedRAMP High posture, prefer regional GovCloud services for the protected SPA path unless the compliance team explicitly approves CloudFront for the boundary and data type.
+## Why not S3 static website hosting as the primary model?
 
-## Frontend Delivery
+S3 + CloudFront is excellent for public or tokenized static delivery, but this requirement says frontend assets themselves must be unavailable unless authenticated. Common S3 website hosting patterns either make objects public, protect them by origin headers, or rely on CloudFront/Lambda@Edge OIDC. That creates two problems:
 
-The React SPA should be built into immutable static artifacts, but not published as anonymously readable S3 website content.
+1. **GovCloud/FedRAMP boundary complexity**: AWS’s GovCloud SPA reference explicitly uses CloudFront from a standard Region because CloudFront is not available from GovCloud Regions. AWS’s FedRAMP services table lists CloudFront for Moderate but not High/GovCloud.
+2. **Authentication semantics**: protecting every asset with OIDC is simpler and more auditable at ALB than at S3 website endpoints.
 
-Recommended path:
+Recommended asset hosting options, in priority order:
 
-1. Build the React app in CI.
-2. Store artifacts in a private S3 bucket with S3 Block Public Access enabled, or bake them into a minimal Nginx container image.
-3. Run a private frontend asset service in ECS/Fargate or EC2.
-4. Put a public ALB in front of it.
-5. Configure every app route, including `/*`, with `authenticate-oidc`.
-6. Forward only authenticated requests to the frontend target group.
+1. **ECS Fargate static asset service behind ALB OIDC** — preferred. Build React once, package `/dist` into a minimal Nginx image, run read-only root filesystem, and serve only through ALB.
+2. **Lambda web adapter/static handler behind ALB** — acceptable for lower traffic; simpler operations but less natural for large asset sets.
+3. **Private S3 + application asset proxy** — the frontend service fetches from S3 using task role and streams assets; useful if asset artifacts must remain in S3/KMS, but adds proxy complexity.
+4. **CloudFront + OIDC at edge** — only if the compliance boundary permits commercial-region CloudFront and the team accepts Lambda@Edge/custom auth logic.
 
-This means:
+## Browser authentication and request model
 
-- `GET /` requires authentication.
-- `GET /assets/app.js` requires authentication.
-- Deep links such as `/commercial/orders/123` require authentication and then fall back to the SPA entry point.
-- The browser receives normal static files after login, but the origin is never public.
+### Initial page load
 
 ```mermaid
 sequenceDiagram
-    participant B as Browser
-    participant A as ALB
-    participant I as OIDC IdP
-    participant F as Frontend asset service
+  participant B as Browser
+  participant A as ALB
+  participant I as OIDC IdP
+  participant F as Frontend asset service
 
-    B->>A: GET /assets/app.js
-    A-->>B: 302 to IdP if no ALB auth session
-    B->>I: Login / MFA
-    I-->>A: Redirect with authorization code
-    A->>I: Code exchange
-    I-->>A: Tokens / user info
-    A-->>B: ALB session cookie
-    B->>A: GET /assets/app.js with session cookie
-    A->>F: Forward authenticated request
-    F-->>B: JavaScript asset
+  B->>A: GET https://app.example.gov/
+  A->>A: Listener rule requires authenticate-oidc
+  A-->>B: 302 to IdP authorization endpoint
+  B->>I: Login / MFA / federation
+  I-->>B: 302 https://app.example.gov/oauth2/idpresponse?code=...
+  B->>A: Callback with authorization code
+  A->>I: Token endpoint exchange
+  A->>I: UserInfo request
+  A-->>B: Set secure ALB auth session cookie; 302 original URL
+  B->>A: GET / with ALB auth cookie
+  A->>F: Forward request with x-amzn-oidc-* headers
+  F-->>B: index.html and assets
 ```
 
-## Frontend API Calls
+The React bundle is never fetched until the ALB has established an authenticated session.
 
-Do not require the SPA to directly manage long-lived API credentials. Prefer a same-origin request model:
+### SPA API calls
 
-- Browser loads `https://app.example.gov`.
-- Browser calls `https://app.example.gov/api/...`.
-- ALB enforces the browser login session on `/api/*`.
-- ALB forwards identity headers such as OIDC claims to the router.
-- The router verifies the ALB-signed JWT before trusting claims.
-- The router applies route-based authorization and forwards to internal services.
+```mermaid
+sequenceDiagram
+  participant SPA as React SPA
+  participant ALB as ALB
+  participant R as API Router
+  participant S as Backend service
 
-This keeps the frontend simple and avoids leaking access tokens into browser storage. If the product later needs direct browser bearer-token calls, add Authorization Code with PKCE in the SPA, but treat that as a deliberate tradeoff rather than the default.
+  SPA->>ALB: fetch('/api/commercial/orders') with ALB session cookie
+  ALB->>R: Forward with x-amzn-oidc-data, x-amzn-oidc-identity, x-amzn-oidc-accesstoken
+  R->>R: Verify x-amzn-oidc-data signature and signer ALB ARN
+  R->>R: Map user claims/groups/scopes to route permissions
+  R->>S: Private request with normalized identity context
+  S->>S: Tag/attribute-based authorization
+  S-->>R: Response
+  R-->>SPA: JSON response
+```
 
-### Browser Request Contract
+The frontend should use **relative same-origin URLs** (`/api/...`) and `credentials: 'same-origin'` or default browser cookie behavior. Avoid CORS for first-party SPA calls.
 
-In the recommended model, the frontend does **not** add an `Authorization: Bearer ...` header for normal first-party API calls.
+### Auth-expired AJAX behavior
 
-The request looks like this from the SPA:
+ALB has three unauthenticated modes: `authenticate`, `allow`, and `deny`. Use:
 
-```ts
-const response = await fetch("/api/commercial/accounts", {
-  method: "GET",
-  credentials: "same-origin",
-  headers: {
-    "Accept": "application/json",
-    "X-Request-Id": crypto.randomUUID()
+- **SPA asset routes**: `authenticate` so users are redirected to login.
+- **XHR/API routes for browser calls**: prefer a router-owned `/api/session` check and return JSON `401` for expired sessions. If ALB auth is applied directly, AWS notes `deny` returns 401 for AJAX calls without auth, but expired auth can still redirect. The frontend must handle both `401` and unexpected HTML/redirect responses by navigating to a login/start URL.
+- **Partner API routes**: do not use interactive `authenticate`; require bearer/mTLS and return machine-readable `401/403`.
+
+## IdP abstraction
+
+Model the IdP as an OIDC issuer, not as Cognito-specific code.
+
+```mermaid
+classDiagram
+  class IdentityProviderConfig {
+    issuer
+    authorizationEndpoint
+    tokenEndpoint
+    userInfoEndpoint
+    jwksUri
+    clientId
+    secretArn
+    scopes
+    logoutEndpoint?
   }
-});
+
+  class CognitoGovCloud {
+    auth-fips hosted UI
+    FIPS API endpoints
+    no custom domains
+  }
+
+  class OktaOrOtherOIDC {
+    branded domain
+    external MFA/policies
+  }
+
+  IdentityProviderConfig <|-- CognitoGovCloud
+  IdentityProviderConfig <|-- OktaOrOtherOIDC
 ```
 
-The browser automatically includes the ALB session cookie for same-origin requests. JavaScript should not read or write that cookie. The ALB owns the login redirect, token exchange, session cookie, session refresh behavior, and logout behavior.
+Cognito-specific GovCloud caveats:
+
+- API endpoints are FIPS endpoints.
+- Hosted UI domains use `auth-fips` GovCloud formats.
+- Cognito custom domains are not supported in GovCloud.
+- Cognito metadata may leave GovCloud in limited cases per AWS GovCloud documentation, so avoid export-controlled data in pool domain names, custom attribute names, resource server identifiers, and custom scopes.
+
+## API router responsibilities
+
+The router is a product boundary, not just a reverse proxy.
+
+### Required router modules
+
+| Module | Responsibility |
+|---|---|
+| Route registry | Own `/api/{domain}/{version}/...` mappings to services. |
+| Identity normalization | Convert ALB OIDC headers, partner JWTs, and future mTLS cert subjects into one internal `Principal`. |
+| Route-based access control | Enforce scopes/roles/tenant entitlements before forwarding. |
+| Service dispatch | Resolve target service by route and call private service endpoint. |
+| Request shaping | Normalize headers, correlation IDs, tenant IDs, and user context. |
+| Response shaping | Stable public error model; hide service internals. |
+| OpenAPI aggregation | Generate public OpenAPI from exposed routes; exclude internal/frontend routes. |
+| Audit logging | Log principal, route, auth method, decision, service target, status, trace ID. |
+| Policy hooks | Integrate with Amazon Verified Permissions or a local policy engine if needed. |
+
+### Principal model
+
+```mermaid
+classDiagram
+  class Principal {
+    subject
+    type: human|machine|partner
+    authMethod: alb_oidc|oauth2_jwt|mtls|jwt_mtls
+    issuer
+    audience
+    scopes[]
+    groups[]
+    tenantId
+    partnerId
+    certificateSubject?
+    certificateSerial?
+    assuranceLevel?
+  }
+
+  class RoutePolicy {
+    routeId
+    requiredScopes[]
+    allowedPrincipalTypes[]
+    tenantMode
+    downstreamTags[]
+  }
+
+  Principal --> RoutePolicy : evaluated against
+```
+
+Browser users and partners should end up in the same policy engine with different `type` and `authMethod` values.
+
+## Authorization model
+
+Recommended path from the prompt:
+
+1. **Route-based access control in the router**
+   - Route examples:
+     - `GET /api/commercial/v1/orders` requires `commercial:orders:read`.
+     - `POST /api/user-management/v1/users` requires `user-management:users:write`.
+     - `GET /internal/frontend/v1/config` requires `frontend:runtime:read` and `principal.type == human`.
+   - Store route policies with the route registry and publish them alongside OpenAPI.
+
+2. **Tag/attribute-based authorization in services**
+   - Router decides whether the caller can invoke the operation.
+   - Service decides whether the caller can access the specific object based on tenant, agency, partner, data classification, record owner, or resource tags.
+
+3. **No direct service exposure**
+   - Security groups and route tables prevent public access to backend services.
+   - Services reject requests without router-signed internal identity context or mTLS/service mesh identity.
+
+## Machine-to-machine and partner SDK auth
+
+### Near-term: OAuth2 client credentials
 
 ```mermaid
 sequenceDiagram
-    participant SPA as React SPA
-    participant Browser as Browser cookie jar
-    participant ALB as Authenticated ALB
-    participant Router as Router
+  participant C as Partner SDK / service
+  participant I as OIDC token endpoint
+  participant A as ALB or API Gateway
+  participant R as Router
 
-    SPA->>Browser: fetch('/api/...', credentials same-origin)
-    Browser->>ALB: HTTPS request with ALB auth session cookie
-    ALB->>ALB: Validate session cookie
-    ALB->>Router: Forward request with identity headers
-    Router->>Router: Verify ALB-signed JWT
+  C->>I: client_credentials grant for scopes
+  I-->>C: access_token JWT
+  C->>A: HTTPS request Authorization: Bearer token
+  A->>R: Forward request
+  R->>R: Validate JWT issuer, audience, signature, exp, scopes
+  R->>R: Build machine/partner Principal
+  R-->>C: API response
 ```
 
-The ALB forwards identity context to the router using AWS-managed headers. The important headers are:
+Token rules:
 
-| Header | Who sets it | Used by router? | Purpose |
-| --- | --- | --- | --- |
-| `Cookie` | Browser | No direct authorization use | Contains the ALB-managed session cookie; opaque to the SPA and router |
-| `x-amzn-oidc-data` | ALB | Yes | ALB-signed JWT containing user claims from the IdP user info endpoint |
-| `x-amzn-oidc-identity` | ALB | Optional | Subject identity shortcut |
-| `x-amzn-oidc-accesstoken` | ALB | Usually no | Access token from the IdP; avoid using it as the primary router trust object |
-| `X-Request-Id` or `traceparent` | SPA | Yes for tracing | Correlation and telemetry, not authentication |
+- Use access tokens, not ID tokens, for API authorization.
+- Require scopes per route.
+- Use dedicated audiences/resource servers for partner APIs.
+- Use short token lifetimes and client secret/certificate rotation.
+- If Cognito is used, define resource servers and custom scopes, but avoid sensitive names in scope identifiers because AWS notes Cognito metadata can leave GovCloud in limited cases.
 
-The router must trust only requests that arrive from the ALB security boundary. It should verify `x-amzn-oidc-data` before using any identity claims:
+### mTLS path
 
-1. Parse the JWT header.
-2. Verify the signature using the ALB public key endpoint for the GovCloud region.
-3. Validate the `signer` field against the expected ALB ARN.
-4. Validate expiration.
-5. Map claims such as `sub`, `email`, `groups`, `tenant`, or custom claims into an internal principal.
-6. Apply route policy.
+Two viable paths:
 
-The SPA can include non-security headers such as `Accept`, `Content-Type`, `X-Request-Id`, `traceparent`, and idempotency keys. It should not include user id, tenant id, roles, groups, or scopes as trusted headers. Any user-controlled header must be ignored or overwritten by the router.
+| Path | When to choose | Notes |
+|---|---|---|
+| **ALB mTLS on `api.example.gov`** | You want one ALB front door for browser + partner traffic. | Use ALB verify mode with AWS Private CA or approved partner CA trust bundles. Router reads `X-Amzn-Mtls-*` headers and combines cert identity with JWT scopes. |
+| **API Gateway regional custom domain with mTLS** | You want gateway-native JWT authorizers, usage plans/throttling, or separate partner edge controls. | GovCloud API Gateway supports mTLS custom domains, but mTLS is not supported for private APIs and GovCloud has integration differences. Validate private integration support in chosen Region. |
 
-For unsafe methods such as `POST`, `PUT`, `PATCH`, and `DELETE`, add CSRF protection because the browser uses cookies:
+Recommended future state: **JWT + mTLS** for partners. mTLS proves possession of partner-issued/client cert; JWT conveys client identity, scopes, tenant/partner entitlement, and revocable authorization.
 
-- Prefer `SameSite` protections where compatible with the ALB and IdP flow.
-- Add a CSRF token endpoint such as `GET /internal/frontend/csrf`.
-- Return a server-generated CSRF token after authentication.
-- Require the SPA to send it in a header such as `X-CSRF-Token`.
-- Bind the token to the ALB session or a backend session record.
+## SDK generation strategy
 
-Example write request:
-
-```ts
-await fetch("/api/commercial/accounts", {
-  method: "POST",
-  credentials: "same-origin",
-  headers: {
-    "Accept": "application/json",
-    "Content-Type": "application/json",
-    "X-CSRF-Token": csrfToken,
-    "Idempotency-Key": crypto.randomUUID(),
-    "traceparent": currentTraceparent
-  },
-  body: JSON.stringify(payload)
-});
-```
-
-This makes frontend requests work like a traditional authenticated web app while the router still gets structured identity for API authorization.
-
-```mermaid
-sequenceDiagram
-    participant SPA as React SPA
-    participant ALB as Authenticated ALB
-    participant R as Router
-    participant S as Domain service
-
-    SPA->>ALB: fetch('/api/commercial/accounts')
-    ALB->>R: Request + ALB OIDC identity headers
-    R->>R: Verify ALB JWT signature and route policy
-    R->>S: Forward with normalized principal context
-    S->>S: Enforce tag/resource policy
-    S-->>R: Domain response
-    R-->>SPA: Response
-```
-
-## Router Responsibilities
-
-The router is the canonical API front door for all backend services. It should be a real service, not only ALB listener rules, because the requirements include SDK generation, partner use, route authorization, machine-to-machine auth, and future mTLS.
-
-Recommended implementation: run the router as a private application service on **ECS/Fargate, EKS, or EC2**, with ALB and API Gateway in front of it. API Gateway is the managed API edge for partner and machine-to-machine traffic. The Lambda authorizer is only an authentication/authorization plug-in at that edge. It is not the router.
-
-```mermaid
-flowchart LR
-    Browser[Browser SPA] -->|ALB session cookie| AppALB[App ALB with OIDC auth]
-    AppALB -->|/api/* plus ALB identity headers| Router[Router service on ECS/Fargate, EKS, or EC2]
-
-    Partner[Partner SDK] -->|OAuth token, future mTLS| APIGW[API Gateway]
-    APIGW --> Authorizer[JWT or Lambda authorizer]
-    Authorizer -->|allow| Router
-
-    Router --> Commercial[Commercial service]
-    Router --> Users[User Management service]
-    Router --> Other[Other services]
-```
-
-The router can be implemented with any normal web service stack, for example Go, Java/Spring, .NET, Node.js, Rust, or Python/FastAPI. The important point is that it owns the platform API behavior, not just request forwarding.
-
-Router responsibilities:
-
-- Normalize identity from browser sessions, OAuth access tokens, service tokens, and future mTLS client certificates.
-- Enforce route-based access control at the edge of the backend platform.
-- Add a standard principal context header or signed internal token for downstream services.
-- Route to backend services by path and version, for example `/v1/commercial/*` and `/v1/users/*`.
-- Emit audit logs with subject, client id, route, decision, downstream service, request id, and correlation id.
-- Own the externally supported OpenAPI contract used for SDK generation.
-- Keep frontend-only support endpoints separate from the partner SDK surface.
-
-Downstream services should still enforce tag-based or resource-level authorization. The router answers "can this caller access this route?"; services answer "can this caller access this tenant, account, record, or tagged resource?"
-
-### Why Not Only API Gateway
-
-API Gateway should be used as an edge service, especially for partners, but it should not be the whole router if the route layer needs product semantics, custom policy, cross-service composition, OpenAPI ownership, SDK lifecycle control, audit normalization, and multiple identity modes.
-
-API Gateway is good at:
-
-- Custom domains.
-- TLS and mTLS termination.
-- Request throttling and quotas.
-- JWT or Lambda authorizers.
-- Basic request validation and transformation.
-- Usage plans and API keys where appropriate.
-- Private integration into the VPC.
-
-The router service is better at:
-
-- Mapping several identity sources into one internal principal model.
-- Enforcing route policy using product concepts.
-- Producing one stable public API contract across multiple backend services.
-- Hiding backend service topology from partners and the SPA.
-- Adding signed internal principal context for services.
-- Handling cross-service workflows and response shaping where needed.
-- Keeping frontend-only endpoints out of partner SDKs.
-
-### Why Not Only Lambda Authorizer
-
-A Lambda authorizer can answer "is this request allowed to enter API Gateway?" It should not become the router because it is invoked in the authorization phase, not as the main application handler. It is not the right place to compose backend calls, own API versioning, normalize responses, emit full application audit events, or generate SDK contracts.
-
-Use a Lambda authorizer only when API Gateway's native JWT authorizer is not enough, such as:
-
-- Custom token introspection.
-- Non-standard claims mapping.
-- Partner-specific policy lookup.
-- Certificate-to-principal mapping alongside mTLS.
-
-### When Lambda Could Be the Router
-
-The router could technically be a Lambda function behind API Gateway if the backend surface is small and request volume, latency, connection reuse, and operational requirements fit Lambda well.
-
-For this architecture, prefer a long-running service because the router is expected to become a central platform component. A service is usually a better fit for:
-
-- Many backend integrations.
-- Shared connection pools.
-- More predictable low latency.
-- Rich routing and policy code.
-- Larger OpenAPI surface area.
-- Internal service discovery.
-- More conventional local development and load testing.
+The SDK should represent the **router’s public contract**, not every backend service’s native API.
 
 ```mermaid
 flowchart TD
-    REQ[Incoming request] --> AUTHN[Authenticate caller]
-    AUTHN --> NORM["Normalize principal: user, partner app, service"]
-    NORM --> RBAC[Route policy decision]
-    RBAC -->|deny| DENY[403 / audit]
-    RBAC -->|allow| ROUTE[Resolve target service]
-    ROUTE --> CTX[Attach signed principal context]
-    CTX --> SVC[Backend service]
-    SVC --> TAGS[Tag/resource authorization]
+  S1[Service-owned internal OpenAPI specs] --> R[Router route registry]
+  R --> P[Public partner OpenAPI bundle]
+  R --> F[Frontend/internal OpenAPI bundle]
+  P --> G[OpenAPI Generator / Smithy / custom generator]
+  G --> SDK[Partner SDKs]
+  F --> FEClient[Internal frontend client only]
 ```
 
-## Partner and Machine-to-Machine API
+### Rules
 
-Expose partners through `https://api.example.gov`, not through the browser app domain.
+- Router owns externally visible paths, versioning, errors, pagination, idempotency, and auth scopes.
+- Service teams may own internal specs, but the router publishes the partner-facing composition.
+- Mark endpoints with visibility:
+  - `public-partner`: included in SDK.
+  - `frontend-only`: used by React app, excluded from partner SDK.
+  - `internal`: not reachable from public ingress.
+- Publish SDKs with:
+  - OAuth2 client credentials helper.
+  - Retry/backoff policy aligned with router idempotency rules.
+  - Request ID/correlation header propagation.
+  - Optional mTLS client certificate configuration once enabled.
+- Keep generated clients thin. Do not embed business authorization logic in the SDK.
 
-Recommended path:
+## Frontend-support service
 
-- Use API Gateway as the managed API edge.
-- Use OAuth 2.0 client credentials from Cognito or another OIDC IdP for machine-to-machine access.
-- Validate tokens with a JWT or Lambda authorizer.
-- Forward valid requests to the router through a private integration/VPC Link.
-- Add usage plans, throttling, WAF, request logging, and per-partner observability.
-- Enable mTLS on the API Gateway custom domain when certificate-based partner authentication is required.
+The prompt calls out a frontend service for an integration, AppConfig, and OTel telemetry that should not be in the SDK. Treat this as a separate **frontend-support route group**.
 
-API Gateway REST APIs have native SDK generation, and AWS documents that the SDK must be regenerated after API updates. For a partner SDK program, the better long-term source of truth is the router's OpenAPI document, then generate SDKs in the supported languages from that contract. If AWS-native generation is mandatory, keep the partner-facing API on API Gateway REST API and generate from the deployed stage.
+### Responsibilities
+
+| Capability | Recommended implementation |
+|---|---|
+| Integration helper | Server-side ECS service behind `/internal/frontend/v1/integration/*`; receives ALB-authenticated user context. |
+| Runtime config | AppConfig Agent sidecar in the support service; browser calls `/internal/frontend/v1/config`, service reads `localhost:2772`. |
+| Telemetry bootstrap | Endpoint returns non-secret OTel config: collector URL, environment, sampling flags. |
+| Browser telemetry ingestion | Use `/internal/frontend/v1/telemetry` or a dedicated collector endpoint, authenticated by ALB session and rate-limited. |
+| Exclusion from SDK | Tag OpenAPI operations as `x-visibility: frontend-only`; public SDK generator ignores them. |
+
+Do **not** put AppConfig credentials, AppConfig data-plane calls, or privileged integration secrets in the React bundle.
+
+## Deployment topology
 
 ```mermaid
-flowchart LR
-    P[Partner workload] -->|client credentials token| IDP[OIDC IdP]
-    IDP -->|access token| P
-    P -->|Authorization: Bearer token| APIGW[API Gateway]
-    APIGW --> AUTHZ[JWT or Lambda authorizer]
-    AUTHZ -->|allow| ROUTER[Router]
-    ROUTER --> SERVICES[Backend services]
+flowchart TB
+  subgraph GovCloudAccount[AWS GovCloud workload account]
+    subgraph PublicSubnets[Public subnets]
+      ALB[Public ALB + WAF + ACM cert]
+      NAT[NAT Gateway if ALB or tasks need outbound IdP/API access]
+    end
 
-    CERT[Future client certificate] -.->|mTLS custom domain| APIGW
+    subgraph PrivateAppSubnets[Private app subnets]
+      FE[ECS service: frontend assets]
+      Router[ECS service: API router]
+      FS[ECS service: frontend support]
+      OTel[ADOT / OTel collector sidecars or service]
+    end
+
+    subgraph PrivateServiceSubnets[Private service subnets]
+      Comm[Commercial service]
+      UserMgmt[User management service]
+      Other[Other services]
+    end
+
+    subgraph DataControl[Data/control plane]
+      ECR[ECR]
+      S3[S3 artifact/log buckets]
+      KMS[KMS CMKs]
+      Secrets[Secrets Manager]
+      CW[CloudWatch Logs/Metrics]
+      CT[CloudTrail]
+      CFG[AWS Config]
+      AppConfig[AWS AppConfig]
+    end
+  end
+
+  ALB --> FE
+  ALB --> Router
+  ALB --> FS
+  Router --> Comm
+  Router --> UserMgmt
+  Router --> Other
+  FE --> CW
+  Router --> CW
+  FS --> AppConfig
 ```
 
-## Frontend Support Service
+### Network controls
 
-Create a separate frontend support service for capabilities that should not appear in the partner SDK:
+- ALB security group allows inbound `443` only from approved internet ranges or public as required.
+- Target security groups allow inbound only from the ALB security group.
+- Backend service security groups allow inbound only from router task security group or internal mesh/load balancer.
+- ECS tasks run in private subnets.
+- Use VPC endpoints for supported AWS APIs to reduce internet egress.
+- If ALB OIDC must call public IdP endpoints, ensure outbound IPv4 connectivity as AWS requires ALB to reach token and user-info endpoints. For internal ALBs or no public IPv4, AWS notes NAT can be required.
 
-- Integration-specific frontend helper endpoints.
-- AppConfig bootstrap or feature flag evaluation needed by the SPA.
-- OpenTelemetry browser telemetry intake or telemetry configuration.
-- Session/user display metadata that is not part of the partner API.
+## Security and compliance controls
 
-Preferred placement:
+| Area | Control |
+|---|---|
+| Transport | TLS 1.2+ everywhere; ACM certificates; HTTPS target groups if forwarding ALB OIDC headers; future mTLS for partner domain. |
+| Asset protection | SPA files served only by private ECS tasks behind ALB `authenticate-oidc`. No public S3 website endpoint. |
+| Header trust | Router verifies `x-amzn-oidc-data` signature and `signer` ALB ARN; target SG only permits ALB. |
+| Secrets | OIDC client secret in Secrets Manager; task roles least privilege. |
+| Encryption | KMS CMKs for S3 logs/artifacts, ECS secrets, application data. |
+| Audit | CloudTrail, ALB access and connection logs, router authorization decision logs, service audit events. |
+| WAF | AWS WAF on ALB for common web exploits, rate-based rules, bot controls as permitted. |
+| Observability | CloudWatch Logs/Metrics, X-Ray/ADOT, trace ID propagated from ALB/router to services. |
+| Configuration | AWS Config rules, Security Hub CSPM, IAM Access Analyzer where available/approved. |
+| FedRAMP boundary | Validate service-by-service inclusion using AWS Artifact and customer SSP. Avoid export-controlled data in AWS service metadata called out by GovCloud docs. |
 
-- Put it behind the router under an internal namespace such as `/internal/frontend/*` if it benefits from the same identity normalization, audit, throttling, and route policy engine.
-- Exclude `/internal/frontend/*` from the public OpenAPI/SDK contract.
-- If the service has very different scaling, ingestion, or telemetry needs, expose it as a separate ALB target behind the same authenticated app ALB and keep it off `api.example.gov`.
+## Key implementation details
 
-AWS AppConfig is available in GovCloud, and AWS announced FedRAMP High authority to operate for AppConfig in GovCloud regions. For browser telemetry, use OTEL-compatible browser instrumentation, but avoid sending unauthenticated telemetry directly to internal collectors. Route it through the authenticated frontend support endpoint or a purpose-built telemetry ingestion endpoint with abuse controls.
+### ALB listener rules
 
-## Identity Abstraction
+Recommended priority order:
 
-Use OIDC/OAuth interfaces everywhere:
+1. `/oauth2/*` — ALB-managed callback paths.
+2. `/healthz` — unauthenticated or restricted health endpoint for ALB only.
+3. `/api/partner/*` — forward to router without interactive ALB OIDC; router validates bearer token; future dedicated mTLS listener/domain.
+4. `/api/*` — either:
+   - `authenticate-oidc` + forward to router for browser-only APIs, or
+   - `allow`/no ALB auth and router accepts either ALB headers or bearer token, depending on how partner and browser APIs share paths.
+5. `/internal/frontend/*` — `authenticate-oidc` + forward to frontend-support service.
+6. `/*` — `authenticate-oidc` + forward to frontend asset service, with SPA fallback to `index.html`.
 
-- Browser login: OIDC authorization code flow handled by ALB.
-- Partner M2M: OAuth client credentials.
-- Future enterprise IdP: Okta or another OIDC provider.
-- Cognito first path: Cognito User Pools and hosted UI/domain where appropriate.
+For clean semantics, prefer **separate partner path/domain** so browser API auth can use ALB OIDC without breaking machine clients.
 
-The router should not contain Cognito-specific assumptions. It should depend on:
-
-- Issuer allowlist.
-- JWKS discovery or configured public keys.
-- Audience/client id validation.
-- Scopes and claims mapped to internal permissions.
-- Tenant and subject normalization.
-
-That lets Cognito be replaced by Okta with a metadata/configuration change and policy migration, not a router rewrite.
-
-## API and SDK Contract
-
-Maintain two OpenAPI contracts:
-
-- `partner-api.openapi.yaml`: public, versioned, SDK-generating, stable, no frontend-only endpoints.
-- `frontend-api.openapi.yaml`: internal browser-facing contract for the SPA and frontend support service.
-
-The router can implement both, but the SDK pipeline must only package the partner API.
+### Router identity validation order
 
 ```mermaid
 flowchart TD
-    ROUTER_SPEC[Router source route definitions] --> PARTNER[partner-api.openapi.yaml]
-    ROUTER_SPEC --> FRONTEND[frontend-api.openapi.yaml]
-    PARTNER --> SDKGEN[SDK generation pipeline]
-    SDKGEN --> TS[TypeScript SDK]
-    SDKGEN --> PY[Python SDK]
-    SDKGEN --> JAVA[Java SDK]
-    FRONTEND --> SPA_CLIENT[Generated or typed SPA client]
+  Req[Incoming request] --> Mtls{mTLS headers present?}
+  Mtls -->|yes| Cert[Validate ALB mTLS header trust context]
+  Mtls -->|no| Jwt{Authorization Bearer present?}
+  Cert --> Jwt
+  Jwt -->|yes| ValidateJWT[Validate OAuth2 JWT issuer/audience/signature/scopes]
+  Jwt -->|no| AlbOidc{x-amzn-oidc-data present?}
+  ValidateJWT --> Principal[Build Principal]
+  AlbOidc -->|yes| ValidateALB[Verify ALB-signed JWT + signer ARN]
+  AlbOidc -->|no| Deny[401]
+  ValidateALB --> Principal
+  Principal --> RouteAuth[Evaluate route policy]
+  RouteAuth -->|allow| Forward[Forward to service]
+  RouteAuth -->|deny| Forbidden[403]
 ```
 
-SDK rules:
+### Logout
 
-- Generate clients from the public OpenAPI contract.
-- Treat the router path and auth scheme as the stable partner interface.
-- Do not generate SDK methods for `/internal/frontend/*`.
-- Version partner APIs explicitly, for example `/v1`.
-- Keep route deprecations and compatibility policy in the SDK release process.
+ALB documentation says applications should expire ALB authentication cookies and redirect to the IdP logout endpoint if supported. Implement `/logout` in the frontend-support service to:
 
-## Route and Service Authorization
+1. Set ALB auth cookie shards to expired.
+2. Redirect to the IdP logout endpoint with post-logout redirect back to an unauthenticated landing page.
+3. Keep the logout landing page outside authenticated ALB rules, as AWS notes logout landing pages are unauthenticated.
 
-Recommended authorization split:
+## Alternatives considered
 
-- Router: route-based access control.
-- Services: tag-based and resource-level authorization.
+| Alternative | Pros | Cons | Recommendation |
+|---|---|---|---|
+| S3 + CloudFront + Lambda@Edge OIDC | CDN performance; common SPA pattern. | CloudFront not GovCloud regional; FedRAMP High/GovCloud boundary concern; custom edge auth; asset auth complexity. | Not primary. Use only with AO approval. |
+| API Gateway for all frontend and API traffic | JWT authorizers, mTLS, throttling, OpenAPI import/export. | Does not serve protected SPA assets as naturally; GovCloud private integration differences; still needs static asset origin. | Good optional partner API edge, not SPA asset gate. |
+| ALB + ECS for frontend and router | Strong protected-assets story; GovCloud regional; generic OIDC; same-origin browser calls; mTLS path. | Less CDN caching; must operate ECS services. | Recommended. |
+| AWS Verified Access for frontend | Policy-rich app access service. | Verify service availability/features and fit for SPA assets/router; may not satisfy SDK/partner API front door alone. | Consider for workforce-only web access, not the baseline. |
+| Browser obtains tokens directly and calls APIs with bearer token | Standard SPA OAuth pattern; simpler API gateway JWT validation. | Tokens in browser; duplicate auth logic; asset protection still needs ALB/edge auth. | Possible, but ALB/BFF-style session is cleaner for protected assets. |
 
-Example:
+## Phased roadmap
 
-| Layer | Decision | Example |
-| --- | --- | --- |
-| API Gateway | Is the request structurally acceptable and authenticated? | Valid client credentials token, rate limit not exceeded |
-| Router | Can this caller invoke this route? | Partner A can call `GET /v1/commercial/accounts` |
-| Service | Can this caller access this resource? | Partner A can read account tagged `partner=A` |
-| Data layer | Is the query constrained? | Tenant id or resource tags are mandatory predicates |
+### Phase 1 — Protected SPA and browser API foundation
 
-This avoids putting all authorization in the router while still giving the platform one central policy point for exposed routes.
+- Deploy ALB, WAF, ACM certificate, ECS cluster, frontend asset service, router service.
+- Configure ALB `authenticate-oidc` with Cognito GovCloud or external OIDC IdP.
+- Serve React assets only through authenticated ALB route.
+- Implement router validation for ALB `x-amzn-oidc-data` signer and claims.
+- Frontend uses relative `/api/*` calls.
+- Add frontend-support service for config/integration/telemetry bootstrap, excluded from SDK.
 
-## Deployment Notes
+### Phase 2 — Partner API and SDK
 
-Use these as baseline deployment constraints:
+- Define public route registry and route scopes.
+- Add OAuth2 client-credentials validation in router.
+- Publish OpenAPI for `public-partner` routes only.
+- Generate SDKs from router OpenAPI.
+- Add partner onboarding: client registration, scopes, quotas, audit logs, sandbox.
 
-- Deploy to AWS GovCloud regions.
-- Use ACM certificates on ALB and API Gateway custom domains.
-- Keep frontend S3 buckets private with S3 Block Public Access enabled if S3 is used for artifact storage.
-- Keep frontend and router targets in private subnets.
-- Restrict target security groups to accept traffic only from the ALB or private integration path.
-- Validate ALB-signed user claims in the router before making authorization decisions.
-- Log ALB, API Gateway, router, and service decisions to CloudWatch Logs or the approved FedRAMP logging stack.
-- Use AWS WAF where supported and required by the boundary.
-- Keep CloudTrail enabled for management events and data events where needed.
+### Phase 3 — Hardened B2B ingress
 
-## Service Choice Summary
+- Add `api.example.gov` dedicated listener/domain.
+- Enable ALB mTLS verify mode or API Gateway mTLS custom domain.
+- Bind certificates to partner records and require JWT + mTLS for high-risk routes.
+- Add revocation processes and certificate rotation playbooks.
 
-| Concern | Recommended service | Reason |
-| --- | --- | --- |
-| Authenticated SPA assets | ALB OIDC + private ECS/Fargate or EC2 asset service | Prevents unauthenticated asset fetches without public S3 |
-| Browser login | OIDC IdP through ALB | Generic IdP path; Cognito or Okta can fit |
-| Browser API calls | Same-origin `/api/*` through ALB to router | Avoids exposing API tokens to SPA by default |
-| Partner API | API Gateway custom domain to router | M2M auth, throttling, SDK path, future mTLS |
-| Router | ECS/Fargate, EKS, or EC2 service | Central route policy, identity normalization, OpenAPI ownership |
-| SDK generation | OpenAPI generator pipeline; API Gateway REST SDK if required | Keeps SDK tied to supported public contract |
-| AppConfig / OTEL / frontend integrations | Frontend support service | Excluded from partner SDK, still authenticated |
-| Future mTLS | API Gateway custom domain mTLS | AWS-supported path for partner cert authentication |
+### Phase 4 — Advanced policy and operations
 
-## Main Tradeoffs
+- Integrate Amazon Verified Permissions or policy-as-code if route policies outgrow static configuration.
+- Add canary releases at router route level.
+- Add contract tests between router OpenAPI and service implementations.
+- Add anomaly detection and per-partner rate controls.
 
-### ALB-Protected SPA vs CloudFront/S3
+## Open questions for final design
 
-ALB-protected SPA is more regional and compliance-friendly for GovCloud/FedRAMP High, and it cleanly blocks unauthenticated asset access. It gives up CDN edge caching. For most authenticated federal business apps, that is usually acceptable.
+1. Which GovCloud Region: `us-gov-west-1`, `us-gov-east-1`, or active/active? This affects API Gateway private integration options and IdP endpoint choices.
+2. Is commercial-region CloudFront categorically prohibited, or just not preferred? If allowed, it can be an optional CDN layer, but it should not weaken asset auth.
+3. Will Cognito be authoritative or only a broker to agency/enterprise IdPs?
+4. Are partner SDK users external internet clients, private network clients, or both?
+5. Are partners required to use FIPS endpoints and mTLS from day one?
+6. What is the expected SPA asset size and traffic profile? This determines whether lack of CDN is acceptable.
+7. Does the FedRAMP boundary allow telemetry egress to third-party observability tools, or must all OTel data stay in GovCloud CloudWatch/X-Ray/OpenSearch?
 
-### Same-Origin Browser API vs SPA-Held Access Tokens
+## Source notes
 
-Same-origin calls keep tokens out of browser JavaScript and let ALB own the login session. The tradeoff is that the router must understand ALB identity headers. If the SPA needs to call APIs from multiple domains or third-party APIs directly, add PKCE later.
-
-### API Gateway as Edge vs Router as Edge
-
-API Gateway is valuable for partner traffic because of managed auth integration points, throttling, custom domains, mTLS, logging, and SDK support. The router should still own product routing semantics and public API contracts so the backend architecture is not trapped in API Gateway configuration.
-
-## Sources
-
-- [AWS GovCloud compliance overview](https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/govcloud-compliance.html)
-- [AWS services in scope for FedRAMP](https://aws.amazon.com/compliance/services-in-scope/FedRAMP/)
-- [Amazon Cognito in AWS GovCloud](https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/govcloud-cog.html)
-- [Authenticate users using an Application Load Balancer](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/listener-authenticate-users.html)
-- [Amazon S3 Block Public Access](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html)
-- [Amazon API Gateway mTLS announcement](https://aws.amazon.com/about-aws/whats-new/2020/09/amazon-api-gateway-supports-mutual-tls-authentication/)
-- [API Gateway private integrations and VPC links](https://aws.amazon.com/blogs/compute/understanding-vpc-links-in-amazon-api-gateway-private-integrations/)
-- [Generate a JavaScript SDK for API Gateway REST API](https://docs.aws.amazon.com/apigateway/latest/developerguide/generate-javascript-sdk-of-an-api.html)
-- [AWS AppConfig FedRAMP High ATO in GovCloud](https://aws.amazon.com/about-aws/whats-new/2022/11/aws-appconfig-fedramp-high-authority-to-operate/)
-- [CloudFront documentation overview](https://aws.amazon.com/documentation-overview/cloudfront/)
+- [AWS GovCloud FedRAMP Marketplace entry](https://www.fedramp.gov/marketplace/products/F1603047866/) lists AWS GovCloud as certified and describes it as intended for sensitive government workloads and ITAR-aligned use.
+- [AWS services in scope for FedRAMP](https://aws.amazon.com/compliance/services-in-scope/FedRAMP/) lists current service scope, including API Gateway, Cognito, ECS, ECR, S3, CloudWatch, X-Ray, WAF, ACM, KMS, Secrets Manager, Private CA, and others under FedRAMP High/GovCloud; CloudFront is listed under Moderate, not High/GovCloud, as of the fetched page.
+- [Amazon Cognito in AWS GovCloud](https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/govcloud-cog.html) documents FIPS endpoints, hosted UI URL format, lack of custom domains, and export-controlled metadata considerations.
+- [ALB user authentication](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/listener-authenticate-users.html) documents OIDC authentication, redirects, session cookies, `x-amzn-oidc-*` headers, CloudFront forwarding caveats, and GovCloud public key endpoints for header signature verification.
+- [ALB mutual TLS](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/mutual-authentication.html) documents verify/passthrough mTLS modes and `X-Amzn-Mtls-*` headers.
+- [API Gateway in GovCloud](https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/govcloud-abp.html) documents GovCloud differences, FIPS default APIs, no edge-optimized APIs, mTLS ECDSA server certificate limitation, and HTTP API private integration differences.
+- [API Gateway HTTP API mTLS](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-mutual-tls.html) documents custom domain and truststore requirements, mTLS behavior, and the note that mTLS is not supported for private APIs.
+- [API Gateway JWT authorizers](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-jwt-authorizer.html) documents issuer/audience/signature/expiry/scope validation and recommends scopes for API authorization.
+- [AWS AppConfig Agent for ECS/EKS](https://docs.aws.amazon.com/appconfig/latest/userguide/appconfig-integration-containers-agent.html) documents sidecar caching, localhost port 2772 retrieval, and required IAM actions.
+- [AWS Public Sector GovCloud serverless web app reference](https://aws.amazon.com/blogs/publicsector/how-improve-government-customer-experience-building-modern-serverless-web-application-aws-govcloud-us/) provides a GovCloud SPA reference and explicitly notes CloudFront is deployed in a standard Region because it is not available from GovCloud Regions.
